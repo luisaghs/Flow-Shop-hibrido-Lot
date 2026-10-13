@@ -1,31 +1,67 @@
 """
 =============================================================================
-PROGRAMACIÓN DE UN HYBRID FLOW SHOP (HFS) CON LOT STREAMING POR ETAPA
-Y ALGORITMO GENÉTICO — PRODUCCIÓN DE GUANTES INDUSTRIALES
+PROGRAMACIÓN DE UN HYBRID FLOW SHOP (HFS) CON LOT STREAMING DE SUBLOTES
+CONSISTENTES Y ALGORITMO GENÉTICO — PRODUCCIÓN DE GUANTES INDUSTRIALES
 =============================================================================
 
-Etapas (definidas en el Excel): Troquelado → Ensamblaje → Costura → Voteado.
-Ensamblaje tiene máquinas paralelas NO idénticas (uniformes): cada grupo de
-máquinas tiene un factor de tiempo según su velocidad por docena.
+DATOS
+  Todos los datos del problema se leen del libro de Excel `BD_HFS.xlsx`; el
+  código no contiene trabajos, cantidades, fechas ni tiempos.
+    • "Tiempo de procesamiento": Codigo producto | Maquina | Etapa |
+                                 min x docena | h x docena
+      (tiempo de cada producto en cada máquina de cada etapa)
+    • "Trabajos": Orden de trabajo | Codigo Producto | Cantidad (pares) |
+                  Cantidad (docenas) | Fecha de liberación | Fechas de entrega |
+                  Horas disponibles (fecha de entrega en horas laborables)
+    • "Disponibilidad": Fecha | Dia semana | Horas disponibles | Horas acumuladas
+      (calendario laboral: convierte fechas ↔ horas laborables)
+  Las etapas se ordenan según la numeración de sus máquinas (M1–M4 Troquelado,
+  M5–M24 Ensamble, …). Si un producto no tiene tiempo en una máquina, esa
+  máquina no puede procesarlo (capacidad de máquina).
 
-Los datos se leen de `datos_guantes.xlsx` (ver hoja "Instrucciones").
-Los resultados se guardan en `resultados_programacion.xlsx` y `gantt.png`.
+LOT STREAMING — SUBLOTES CONSISTENTES
+  Se sigue la estrategia 2 / escenario S2 de Gürsoy Yılmaz y Yılmaz (2022),
+  "Lot streaming in hybrid flowshop scheduling problem by considering equal
+  and consistent sublots…", Computers & Industrial Engineering 173, 108745:
+    • Cada lote (orden de trabajo) se divide en B_j sublotes.
+    • Los tamaños de los sublotes de un lote pueden ser distintos entre sí,
+      pero son LOS MISMOS EN TODAS LAS ETAPAS (sublotes consistentes).
+    • Un sublote pasa a la etapa s+1 apenas termina en la etapa s, aunque el
+      resto del lote siga en proceso (traslape entre etapas).
+    • La asignación de las posiciones de los sublotes en el cromosoma es
+      aleatoria (random-based sublot assignment).
+
+  Cromosoma:
+    nivel 1 'tamanos'  : proporciones de los sublotes de cada trabajo
+                         (una sola lista por trabajo → igual en todas las etapas)
+    nivel 2 'secuencia': posiciones de los sublotes (permutación con repetición:
+                         la n-ésima aparición del trabajo j es su sublote n)
+    'k'                : número de sublotes B_j de cada trabajo
+  Decodificación: la etapa 1 procesa los sublotes en el orden del cromosoma;
+  en las etapas siguientes se atienden en orden de llegada (desempate por la
+  posición en el cromosoma). Cada sublote se asigna a la máquina capaz que lo
+  TERMINA más temprano (las máquinas no son idénticas).
+
+  Función objetivo: minimizar la tardanza total ΣTj (desempate: Cmax).
+  Las horas son horas laborables según la hoja "Disponibilidad".
 
 Validación con LEKIN:
   LEKIN no hace lot streaming y admite máximo 10 trabajos. Por eso este
   programa incluye un simulador de reglas de despacho (EDD, SPT, LPT, FIFO,
-  LIFO, MS, CR) para el modelo SIN lot streaming, y genera la hoja
-  `LEKIN_datos` con los tiempos en minutos enteros para cargar en LEKIN.
-  Si el simulador está bien, cada regla debe dar el mismo ΣTj en Python y en
-  LEKIN. Después se compara el AG contra la mejor regla de LEKIN.
+  LIFO, MS, CR) sin lot streaming, y genera la hoja `LEKIN_datos` en minutos
+  enteros para cargar en LEKIN. Si el simulador está bien, cada regla debe
+  dar el mismo ΣTj en Python y en LEKIN.
 """
 
 import copy
+import datetime as dt
 import itertools
 import math
 import os
 import random
+import re
 import sys
+import unicodedata
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -35,68 +71,92 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.ticker as ticker
 
-RUTA_EXCEL = "datos_guantes.xlsx"
+RUTA_EXCEL = "BD_HFS.xlsx"
 RUTA_RESULTADOS = "resultados_programacion.xlsx"
 RUTA_GANTT = "gantt.png"
 
 EPS = 1e-6
 
 # ---------------------------------------------------------------------------
-# 1.  DATOS DEL PROBLEMA (se llenan desde el Excel con cargar_datos)
+# 1.  PARÁMETROS DEL MÉTODO (no son datos del problema)
 # ---------------------------------------------------------------------------
 
-TRABAJOS: List[int] = []
-DESCRIPCION: Dict[int, str] = {}
-DEMANDA: Dict[int, float] = {}            # [pares]
-DUE_DATE: Dict[int, float] = {}           # [horas]
-RELEASE: Dict[int, float] = {}            # [horas]
-ETAPAS: List[int] = []                    # 1..S en orden de flujo
-NOMBRE_ETAPA: Dict[int, str] = {}
-TIEMPO_MIN_DOCENA: Dict[int, Dict[int, float]] = {}   # [min/docena] estándar
-MAQUINAS: Dict[int, List[dict]] = {}      # etapa → [{'id', 'grupo', 'factor'}]
-MAQUINAS_POR_ETAPA: Dict[int, int] = {}
-
-MAX_SPLIT = 4
-MIN_DOCENAS_POR_SUBLOTE = 0.5
-USAR_FACTORES = True
-ENUMERACION_MAX_N = 8
+MAX_SUBLOTES = 4              # máximo de sublotes por lote (B_j)
+MIN_PARES_SUBLOTE = 60        # tamaño mínimo de un sublote [pares] (5 docenas)
+ENUMERACION_MAX_N = 8         # óptimo exacto sin LS solo si n ≤ este valor
 MAX_TRABAJOS_LEKIN = 10
 
 GA_PARAMS = {
     'poblacion'    : 100,
     'generaciones' : 300,
-    'prob_cruce'   : 0.85,
-    'prob_mutacion': 0.25,
-    'prob_mut_seq' : 0.30,
-    'prob_mut_prop': 0.40,
-    'prob_mut_k'   : 0.30,
+    'prob_cruce'   : 0.90,
+    'prob_mutacion': 0.30,
+    'prob_mut_seq' : 0.50,    # intercambio de dos posiciones de sublotes
+    'prob_mut_tam' : 0.20,    # por trabajo: perturba los tamaños de sus sublotes
+    'prob_mut_k'   : 0.15,    # por trabajo: suma o quita un sublote
     'tam_torneo'   : 3,
     'elitismo'     : True,
     'semilla'      : 42,
 }
 
 # ---------------------------------------------------------------------------
-# 2.  LECTURA DEL EXCEL
+# 2.  DATOS DEL PROBLEMA (se llenan desde el Excel con cargar_datos)
 # ---------------------------------------------------------------------------
 
-def _texto(v) -> str:
-    return "" if pd.isna(v) else str(v).strip()
+TRABAJOS: List[str] = []                  # órdenes de trabajo, en el orden del Excel
+PRODUCTO: Dict[str, str] = {}             # trabajo → código de producto
+DEMANDA: Dict[str, int] = {}              # [pares]
+DUE_DATE: Dict[str, float] = {}           # [horas laborables]
+RELEASE: Dict[str, float] = {}            # [horas laborables]
+FECHA_ENTREGA: Dict[str, Optional[dt.date]] = {}
+ETAPAS: List[int] = []                    # 1..S en orden de flujo
+NOMBRE_ETAPA: Dict[int, str] = {}
+MAQUINAS: Dict[int, List[str]] = {}       # etapa → ['M1', 'M2', …]
+MAQUINAS_POR_ETAPA: Dict[int, int] = {}
+TIEMPO_MIN_DOCENA: Dict[str, Dict[str, float]] = {}   # producto → máquina → min/docena
+CALENDARIO: List[Tuple[dt.date, float, float]] = []   # (fecha, horas, horas acumuladas)
+
+# Derivado: RAPIDEZ[j][s] = [(índice de máquina capaz, horas por par), …]
+RAPIDEZ: Dict[str, Dict[int, List[Tuple[int, float]]]] = {}
+
+# ---------------------------------------------------------------------------
+# 3.  LECTURA DEL EXCEL
+# ---------------------------------------------------------------------------
+
+def _norm(t) -> str:
+    """Texto en minúsculas, sin tildes ni espacios repetidos (para comparar nombres)."""
+    t = unicodedata.normalize("NFKD", str(t)).encode("ascii", "ignore").decode()
+    return " ".join(t.lower().replace("_", " ").split())
 
 
-def _si_no(v) -> bool:
-    return _texto(v).lower() in ("sí", "si", "s", "yes", "true", "1", "1.0", "verdadero")
+def _vacio(v) -> bool:
+    return v is None or (not isinstance(v, str) and pd.isna(v)) or str(v).strip() == ""
 
 
-def _leer_hoja(xls: pd.ExcelFile, hoja: str, columnas: List[str]) -> pd.DataFrame:
-    if hoja not in xls.sheet_names:
-        raise ValueError(f"El Excel no tiene la hoja '{hoja}'. Hojas encontradas: {xls.sheet_names}")
-    df = xls.parse(hoja)
-    df.columns = [str(c).strip() for c in df.columns]
-    faltantes = [c for c in columnas if c not in df.columns]
-    if faltantes:
-        raise ValueError(f"Hoja '{hoja}': faltan las columnas {faltantes}")
-    # Se descartan filas totalmente vacías (p. ej. formato aplicado sin datos)
-    return df.dropna(how="all", subset=columnas).reset_index(drop=True)
+def _buscar_hoja(xls: pd.ExcelFile, clave: str, obligatoria: bool = True) -> Optional[str]:
+    for h in xls.sheet_names:
+        if clave in _norm(h):
+            return h
+    if obligatoria:
+        raise ValueError(f"El Excel no tiene una hoja '{clave}…'. Hojas: {xls.sheet_names}")
+    return None
+
+
+def _columna(df: pd.DataFrame, hoja: str, *candidatos: str,
+             obligatoria: bool = True) -> Optional[str]:
+    """Nombre real de la columna que coincide con alguno de los candidatos."""
+    cols = {_norm(c): c for c in df.columns}
+    for c in candidatos:
+        if _norm(c) in cols:
+            return cols[_norm(c)]
+    for c in candidatos:
+        for k, real in cols.items():
+            if _norm(c) in k:
+                return real
+    if obligatoria:
+        raise ValueError(f"Hoja '{hoja}': falta la columna '{candidatos[0]}'. "
+                         f"Columnas encontradas: {list(df.columns)}")
+    return None
 
 
 def _numero(v, hoja: str, campo: str, minimo: float = 0.0, estricto: bool = False) -> float:
@@ -110,117 +170,198 @@ def _numero(v, hoja: str, campo: str, minimo: float = 0.0, estricto: bool = Fals
     return x
 
 
+def _fecha(v, hoja: str, campo: str) -> dt.date:
+    try:
+        f = pd.Timestamp(v)
+    except (TypeError, ValueError):
+        f = pd.NaT
+    if pd.isna(f):
+        raise ValueError(f"Hoja '{hoja}': '{campo}' debe ser una fecha (valor leído: {v!r})")
+    return f.date()
+
+
+def _num_maquina(m: str) -> Tuple[int, str]:
+    d = re.sub(r"\D", "", m)
+    return (int(d) if d else 0, m)
+
+
+def _leer_calendario(xls: pd.ExcelFile):
+    CALENDARIO.clear()
+    hoja = _buscar_hoja(xls, "disponib", obligatoria=False)
+    if hoja is None:
+        return
+    df = xls.parse(hoja)
+    c_fecha = _columna(df, hoja, "Fecha")
+    c_horas = _columna(df, hoja, "Horas disponibles")
+    # Respaldo si 'Horas disponibles' es una fórmula sin valor calculado:
+    # tabla auxiliar Dia ("1 Lunes", …) → Horas laborables
+    c_dia = _columna(df, hoja, "Dia", obligatoria=False)
+    c_hlab = _columna(df, hoja, "Horas laborables", obligatoria=False)
+    horas_dia = {}
+    if c_dia is not None and c_hlab is not None:
+        for d, hl in zip(df[c_dia], df[c_hlab]):
+            num = re.match(r"\s*(\d)", str(d))
+            if num and not _vacio(hl):
+                horas_dia[int(num.group(1))] = float(hl)
+    filas = []
+    for _, f in df.iterrows():
+        if _vacio(f[c_fecha]):
+            continue
+        fecha = _fecha(f[c_fecha], hoja, "Fecha")
+        if _vacio(f[c_horas]) and fecha.isoweekday() in horas_dia:
+            horas = horas_dia[fecha.isoweekday()]
+        else:
+            horas = _numero(f[c_horas], hoja, f"Horas disponibles ({fecha})")
+        filas.append((fecha, horas))
+    filas.sort()
+    acum = 0.0
+    for fecha, horas in filas:
+        acum += horas
+        CALENDARIO.append((fecha, horas, acum))
+
+
+def fecha_a_horas(fecha: dt.date, fin_del_dia: bool = True) -> float:
+    """Horas laborables acumuladas al final (o al inicio) de 'fecha'."""
+    if not CALENDARIO:
+        raise ValueError("No hay hoja 'Disponibilidad' para convertir fechas a horas")
+    if fecha < CALENDARIO[0][0]:
+        return 0.0
+    for f, horas, acum in CALENDARIO:
+        if f >= fecha:
+            return acum if (fin_del_dia and f == fecha) else acum - horas
+    raise ValueError(f"La fecha {fecha} es posterior al calendario de la hoja 'Disponibilidad'")
+
+
+def horas_a_fecha(h: float) -> Optional[dt.date]:
+    """Día laborable en que se alcanza la hora laborable 'h' (None si sale del calendario)."""
+    for f, horas, acum in CALENDARIO:
+        if horas > 0 and acum >= h - EPS:
+            return f
+    return None
+
+
 def cargar_datos(ruta: str = RUTA_EXCEL):
     """Lee el Excel y llena las estructuras globales del modelo."""
-    global MAX_SPLIT, MIN_DOCENAS_POR_SUBLOTE, USAR_FACTORES
-    global ENUMERACION_MAX_N, MAX_TRABAJOS_LEKIN
-
     xls = pd.ExcelFile(ruta)
+    _leer_calendario(xls)
 
-    # ── Etapas ──
-    df = _leer_hoja(xls, "Etapas", ["Orden", "Etapa"])
-    df = df.sort_values("Orden")
-    nombres = [_texto(n) for n in df["Etapa"]]
-    if len(set(nombres)) != len(nombres) or "" in nombres:
-        raise ValueError("Hoja 'Etapas': los nombres de etapa deben ser únicos y no vacíos")
-    ETAPAS[:] = list(range(1, len(nombres) + 1))
-    NOMBRE_ETAPA.clear()
-    NOMBRE_ETAPA.update({s: n for s, n in zip(ETAPAS, nombres)})
-    etapa_por_nombre = {n.lower(): s for s, n in NOMBRE_ETAPA.items()}
+    # ── Tiempos de procesamiento (definen etapas y máquinas) ──
+    hoja = _buscar_hoja(xls, "tiempo")
+    df = xls.parse(hoja)
+    c_prod = _columna(df, hoja, "Codigo producto", "Producto")
+    c_maq = _columna(df, hoja, "Maquina")
+    c_etapa = _columna(df, hoja, "Etapa")
+    c_min = _columna(df, hoja, "min x docena", obligatoria=False)
+    c_h = _columna(df, hoja, "h x docena", obligatoria=False)
+    if c_min is None and c_h is None:
+        raise ValueError(f"Hoja '{hoja}': falta la columna 'min x docena' (o 'h x docena')")
 
-    # ── Parámetros ──
-    df = _leer_hoja(xls, "Parametros", ["Parametro", "Valor"])
-    par = {_texto(p).lower(): v for p, v in zip(df["Parametro"], df["Valor"])}
-
-    def p(nombre, defecto):
-        v = par.get(nombre.lower())
-        return defecto if v is None or _texto(v) == "" else v
-
-    GA_PARAMS.update({
-        'poblacion'    : int(p("Poblacion", 100)),
-        'generaciones' : int(p("Generaciones", 300)),
-        'prob_cruce'   : float(p("Prob_cruce", 0.85)),
-        'prob_mutacion': float(p("Prob_mutacion", 0.25)),
-        'prob_mut_seq' : float(p("Prob_mut_secuencia", 0.30)),
-        'prob_mut_prop': float(p("Prob_mut_proporciones", 0.40)),
-        'prob_mut_k'   : float(p("Prob_mut_k", 0.30)),
-        'tam_torneo'   : int(p("Tam_torneo", 3)),
-        'elitismo'     : _si_no(p("Elitismo", "Sí")),
-        'semilla'      : None if _texto(par.get("semilla")) == "" else int(float(par["semilla"])),
-    })
-    MAX_SPLIT = int(p("Max_split", 4))
-    MIN_DOCENAS_POR_SUBLOTE = float(p("Min_docenas_sublote", 0.5))
-    USAR_FACTORES = _si_no(p("Usar_factores_velocidad", "Sí"))
-    ENUMERACION_MAX_N = int(p("Enumeracion_max_trabajos", 8))
-    MAX_TRABAJOS_LEKIN = int(p("Max_trabajos_LEKIN", 10))
-    if GA_PARAMS['poblacion'] < 2 or GA_PARAMS['tam_torneo'] < 1 or MAX_SPLIT < 1:
-        raise ValueError("Hoja 'Parametros': Poblacion ≥ 2, Tam_torneo ≥ 1 y Max_split ≥ 1")
-    GA_PARAMS['tam_torneo'] = min(GA_PARAMS['tam_torneo'], GA_PARAMS['poblacion'])
-
-    # ── Máquinas ──
-    df = _leer_hoja(xls, "Maquinas", ["Etapa", "Grupo", "Cantidad_maquinas", "Factor_tiempo"])
-    MAQUINAS.clear()
-    MAQUINAS.update({s: [] for s in ETAPAS})
+    TIEMPO_MIN_DOCENA.clear()
+    etapa_de_maquina: Dict[str, str] = {}
+    nombre_etapa: Dict[str, str] = {}             # nombre normalizado → nombre original
     for _, f in df.iterrows():
-        nombre = _texto(f["Etapa"])
-        s = etapa_por_nombre.get(nombre.lower())
-        if s is None:
-            raise ValueError(f"Hoja 'Maquinas': la etapa '{nombre}' no existe en la hoja 'Etapas'")
-        grupo = _texto(f["Grupo"]) or "G1"
-        cant = _numero(f["Cantidad_maquinas"], "Maquinas", f"Cantidad_maquinas ({nombre} {grupo})")
-        if cant != int(cant):
-            raise ValueError(f"Hoja 'Maquinas': Cantidad_maquinas de {nombre} {grupo} debe ser entero")
-        factor = _numero(f["Factor_tiempo"], "Maquinas", f"Factor_tiempo ({nombre} {grupo})",
-                         estricto=True)
-        for _ in range(int(cant)):
-            MAQUINAS[s].append({'grupo': grupo, 'factor': factor})
-    for s in ETAPAS:
-        if not MAQUINAS[s]:
-            raise ValueError(f"Hoja 'Maquinas': la etapa '{NOMBRE_ETAPA[s]}' no tiene máquinas")
-        # Más rápidas primero: así M1, M2… son las de menor factor
-        MAQUINAS[s].sort(key=lambda m: m['factor'])
-        for i, m in enumerate(MAQUINAS[s], start=1):
-            m['id'] = f"M{i}" if len({x['grupo'] for x in MAQUINAS[s]}) == 1 \
-                else f"M{i}-{m['grupo']}"
-    MAQUINAS_POR_ETAPA.clear()
-    MAQUINAS_POR_ETAPA.update({s: len(MAQUINAS[s]) for s in ETAPAS})
+        if _vacio(f[c_prod]) and _vacio(f[c_maq]):
+            continue
+        prod, maq, etapa = str(f[c_prod]).strip(), str(f[c_maq]).strip(), str(f[c_etapa]).strip()
+        if "" in (prod, maq, etapa):
+            raise ValueError(f"Hoja '{hoja}': fila incompleta ({prod!r}, {maq!r}, {etapa!r})")
+        nombre_etapa.setdefault(_norm(etapa), etapa)
+        if etapa_de_maquina.setdefault(maq, _norm(etapa)) != _norm(etapa):
+            raise ValueError(f"Hoja '{hoja}': la máquina {maq} aparece en dos etapas")
+        if c_min is not None and not _vacio(f[c_min]):
+            t = _numero(f[c_min], hoja, f"min x docena ({prod}, {maq})", estricto=True)
+        elif c_h is not None and not _vacio(f[c_h]):
+            t = 60.0 * _numero(f[c_h], hoja, f"h x docena ({prod}, {maq})", estricto=True)
+        else:
+            continue          # sin tiempo → la máquina no procesa ese producto
+        if maq in TIEMPO_MIN_DOCENA.setdefault(prod, {}):
+            raise ValueError(f"Hoja '{hoja}': el tiempo de {prod} en {maq} está repetido")
+        TIEMPO_MIN_DOCENA[prod][maq] = t
+
+    maq_por_etapa: Dict[str, List[str]] = {}
+    for maq, e in etapa_de_maquina.items():
+        maq_por_etapa.setdefault(e, []).append(maq)
+    for lista in maq_por_etapa.values():
+        lista.sort(key=_num_maquina)
+    # Orden de flujo: según la numeración de las máquinas de cada etapa
+    orden = sorted(maq_por_etapa, key=lambda e: _num_maquina(maq_por_etapa[e][0]))
+    ETAPAS[:] = list(range(1, len(orden) + 1))
+    NOMBRE_ETAPA.clear(); MAQUINAS.clear(); MAQUINAS_POR_ETAPA.clear()
+    for s, e in zip(ETAPAS, orden):
+        NOMBRE_ETAPA[s] = nombre_etapa[e]
+        MAQUINAS[s] = maq_por_etapa[e]
+        MAQUINAS_POR_ETAPA[s] = len(maq_por_etapa[e])
 
     # ── Trabajos ──
-    df = _leer_hoja(xls, "Trabajos", ["Trabajo", "Demanda_pares", "Fecha_entrega_h"])
-    TRABAJOS.clear(); DESCRIPCION.clear(); DEMANDA.clear(); DUE_DATE.clear(); RELEASE.clear()
-    for _, f in df.iterrows():
-        j = int(_numero(f["Trabajo"], "Trabajos", "Trabajo"))
-        if j in DEMANDA:
-            raise ValueError(f"Hoja 'Trabajos': el trabajo {j} está repetido")
-        TRABAJOS.append(j)
-        DESCRIPCION[j] = _texto(f.get("Descripcion", "")) or f"Trabajo {j}"
-        DEMANDA[j] = _numero(f["Demanda_pares"], "Trabajos", f"Demanda_pares (trabajo {j})",
-                             estricto=True)
-        DUE_DATE[j] = _numero(f["Fecha_entrega_h"], "Trabajos", f"Fecha_entrega_h (trabajo {j})")
-        lib = f.get("Liberacion_h", 0)
-        RELEASE[j] = 0.0 if _texto(lib) == "" else _numero(lib, "Trabajos",
-                                                            f"Liberacion_h (trabajo {j})")
-    if len(TRABAJOS) < 2:
-        raise ValueError("Hoja 'Trabajos': se necesitan al menos 2 trabajos")
+    hoja = _buscar_hoja(xls, "trabajo")
+    df = xls.parse(hoja)
+    c_ot = _columna(df, hoja, "Orden de trabajo", "Trabajo")
+    c_prod = _columna(df, hoja, "Codigo Producto", "Producto")
+    c_pares = _columna(df, hoja, "Cantidad (pares)", "pares", obligatoria=False)
+    c_doc = _columna(df, hoja, "Cantidad (docenas)", "docenas", obligatoria=False)
+    c_lib = _columna(df, hoja, "Fecha de liberacion", "liberacion", obligatoria=False)
+    c_ent = _columna(df, hoja, "Fechas de entrega", "Fecha de entrega", obligatoria=False)
+    c_hdisp = _columna(df, hoja, "Horas disponibles", obligatoria=False)
+    if c_pares is None and c_doc is None:
+        raise ValueError(f"Hoja '{hoja}': falta la columna 'Cantidad (pares)'")
 
-    # ── Tiempos ──
-    df = _leer_hoja(xls, "Tiempos", ["Trabajo"])
-    col_por_nombre = {c.lower(): c for c in df.columns}
-    faltantes = [NOMBRE_ETAPA[s] for s in ETAPAS if NOMBRE_ETAPA[s].lower() not in col_por_nombre]
-    if faltantes:
-        raise ValueError(f"Hoja 'Tiempos': faltan las columnas de las etapas {faltantes} "
-                         "(deben llamarse igual que en la hoja 'Etapas')")
-    TIEMPO_MIN_DOCENA.clear()
+    TRABAJOS.clear(); PRODUCTO.clear(); DEMANDA.clear(); DUE_DATE.clear()
+    RELEASE.clear(); FECHA_ENTREGA.clear()
     for _, f in df.iterrows():
-        j = int(_numero(f["Trabajo"], "Tiempos", "Trabajo"))
-        TIEMPO_MIN_DOCENA[j] = {
-            s: _numero(f[col_por_nombre[NOMBRE_ETAPA[s].lower()]], "Tiempos",
-                       f"{NOMBRE_ETAPA[s]} (trabajo {j})")
-            for s in ETAPAS
-        }
-    sin_tiempos = [j for j in TRABAJOS if j not in TIEMPO_MIN_DOCENA]
-    if sin_tiempos:
-        raise ValueError(f"Hoja 'Tiempos': no hay tiempos para los trabajos {sin_tiempos}")
+        if _vacio(f[c_ot]):
+            continue
+        j = str(f[c_ot]).strip()
+        if j in DEMANDA:
+            raise ValueError(f"Hoja '{hoja}': la orden de trabajo {j} está repetida")
+        prod = str(f[c_prod]).strip()
+        if prod not in TIEMPO_MIN_DOCENA:
+            raise ValueError(f"Hoja '{hoja}': el producto {prod} de {j} no tiene tiempos de "
+                             "procesamiento")
+        # Cantidad en pares (si solo hay docenas: pares = docenas × 12)
+        if c_pares is not None and not _vacio(f[c_pares]):
+            pares = _numero(f[c_pares], hoja, f"Cantidad (pares) ({j})", estricto=True)
+        else:
+            pares = 12 * _numero(f[c_doc], hoja, f"Cantidad (docenas) ({j})", estricto=True)
+        if abs(pares - round(pares)) > 1e-6:
+            raise ValueError(f"Hoja '{hoja}': la cantidad de {j} no es un número entero de pares")
+
+        # Fecha de entrega en horas laborables: 'Horas disponibles' o, si la
+        # celda está vacía (fórmula sin calcular), desde el calendario
+        fecha_ent = None
+        if c_ent is not None and not _vacio(f[c_ent]):
+            fecha_ent = _fecha(f[c_ent], hoja, f"Fechas de entrega ({j})")
+        if c_hdisp is not None and not _vacio(f[c_hdisp]):
+            due = _numero(f[c_hdisp], hoja, f"Horas disponibles ({j})")
+        elif fecha_ent is not None:
+            due = fecha_a_horas(fecha_ent)
+        else:
+            raise ValueError(f"Hoja '{hoja}': {j} no tiene 'Horas disponibles' ni fecha de entrega")
+
+        lib = 0.0
+        if c_lib is not None and not _vacio(f[c_lib]) and CALENDARIO:
+            lib = fecha_a_horas(_fecha(f[c_lib], hoja, f"Fecha de liberación ({j})"),
+                                fin_del_dia=False)
+
+        TRABAJOS.append(j)
+        PRODUCTO[j] = prod
+        DEMANDA[j] = int(round(pares))
+        DUE_DATE[j] = due
+        RELEASE[j] = lib
+        FECHA_ENTREGA[j] = fecha_ent if fecha_ent is not None else horas_a_fecha(due)
+    if len(TRABAJOS) < 2:
+        raise ValueError(f"Hoja '{hoja}': se necesitan al menos 2 trabajos")
+
+    # ── Rapidez por máquina capaz [h/par] ──
+    RAPIDEZ.clear()
+    for j in TRABAJOS:
+        RAPIDEZ[j] = {}
+        for s in ETAPAS:
+            tiempos = TIEMPO_MIN_DOCENA[PRODUCTO[j]]
+            RAPIDEZ[j][s] = [(m, tiempos[maq] / 12.0 / 60.0)
+                             for m, maq in enumerate(MAQUINAS[s]) if maq in tiempos]
+            if not RAPIDEZ[j][s]:
+                raise ValueError(f"Ninguna máquina de {NOMBRE_ETAPA[s]} tiene tiempo para el "
+                                 f"producto {PRODUCTO[j]} ({j})")
 
 
 def obtener_ruta_excel(ruta: str = RUTA_EXCEL) -> str:
@@ -240,7 +381,7 @@ def obtener_ruta_excel(ruta: str = RUTA_EXCEL) -> str:
     return next(iter(subidos))
 
 # ---------------------------------------------------------------------------
-# 3.  CONVERSIÓN DE UNIDADES
+# 4.  TIEMPOS
 # ---------------------------------------------------------------------------
 
 def docenas(pares: float) -> float:
@@ -248,208 +389,199 @@ def docenas(pares: float) -> float:
     return pares / 12.0
 
 
-def factor_maquina(s: int, m: int) -> float:
-    return MAQUINAS[s][m]['factor'] if USAR_FACTORES else 1.0
+def tiempo_horas(trabajo: str, etapa: int, m: int, pares: float) -> float:
+    """Tiempo [h] = min/docena del producto en la máquina m × docenas / 60."""
+    maq = MAQUINAS[etapa][m]
+    return TIEMPO_MIN_DOCENA[PRODUCTO[trabajo]][maq] * docenas(pares) / 60.0
 
 
-def tiempo_horas(trabajo: int, etapa: int, cant_docenas: float, factor: float = 1.0) -> float:
-    """Tiempo [h] = (min/docena estándar) × factor de la máquina × docenas / 60."""
-    return TIEMPO_MIN_DOCENA[trabajo][etapa] * factor * cant_docenas / 60.0
+def tiempos_lote_completo() -> Dict[str, Dict[int, List[Tuple[int, float]]]]:
+    """p[j][s] = [(máquina, horas del lote completo en esa máquina), …]."""
+    return {j: {s: [(m, h * DEMANDA[j]) for m, h in RAPIDEZ[j][s]] for s in ETAPAS}
+            for j in TRABAJOS}
 
 
-def calcular_tiempos_completos() -> Dict[int, Dict[int, float]]:
-    """p[trabajo][etapa] = tiempo [h] del lote completo en una máquina estándar."""
-    return {j: {s: tiempo_horas(j, s, docenas(DEMANDA[j])) for s in ETAPAS} for j in TRABAJOS}
+def tiempo_promedio(p_js: List[Tuple[int, float]]) -> float:
+    return sum(t for _, t in p_js) / len(p_js)
 
 # ---------------------------------------------------------------------------
-# 4.  REPRESENTACIÓN DEL CROMOSOMA
+# 5.  REPRESENTACIÓN DEL CROMOSOMA (sublotes consistentes)
 # ---------------------------------------------------------------------------
 
-def _max_k_valido(trabajo: int, etapa: int) -> int:
-    """Máximo de sublotes: limitado por máquinas, MAX_SPLIT y tamaño mínimo de sublote."""
-    por_volumen = int(docenas(DEMANDA[trabajo]) / MIN_DOCENAS_POR_SUBLOTE + EPS)
-    return max(1, min(MAQUINAS_POR_ETAPA[etapa], MAX_SPLIT, por_volumen))
+def max_sublotes(trabajo: str) -> int:
+    """B_j máximo: limitado por MAX_SUBLOTES y por el tamaño mínimo de sublote."""
+    return max(1, min(MAX_SUBLOTES, DEMANDA[trabajo] // MIN_PARES_SUBLOTE))
 
 
 def _dirichlet(k: int) -> List[float]:
     """k proporciones aleatorias positivas que suman 1."""
     muestras = [random.expovariate(1.0) + 1e-9 for _ in range(k)]
     total = sum(muestras)
-    return [m / total for m in muestras]
+    return [x / total for x in muestras]
 
 
-def props_a_docenas(trabajo: int, props: List[float]) -> List[float]:
+def tamanos_pares(trabajo: str, props: List[float]) -> List[int]:
     """
-    Convierte proporciones a docenas, garantizando que cada sublote tenga al
-    menos MIN_DOCENAS_POR_SUBLOTE (reparación en la decodificación) y que la
-    suma sea exactamente la demanda.
+    Convierte las proporciones del cromosoma en tamaños ENTEROS de sublote
+    [pares]: cada sublote tiene al menos MIN_PARES_SUBLOTE y la suma es
+    exactamente la demanda (método del mayor residuo). Estos tamaños se usan
+    en TODAS las etapas (sublotes consistentes).
     """
-    total = docenas(DEMANDA[trabajo])
+    total = DEMANDA[trabajo]
     k = len(props)
-    minimo = min(MIN_DOCENAS_POR_SUBLOTE, total / k)
+    minimo = min(MIN_PARES_SUBLOTE, total // k)
     libre = total - k * minimo
     suma = sum(props)
-    ds = [minimo + libre * p / suma for p in props]
-    ds[-1] += total - sum(ds)   # corrección de redondeo flotante
-    return ds
+    ideal = [libre * p / suma for p in props]
+    base = [int(x) for x in ideal]
+    por_repartir = libre - sum(base)
+    for i in sorted(range(k), key=lambda i: ideal[i] - base[i], reverse=True)[:por_repartir]:
+        base[i] += 1
+    return [minimo + b for b in base]
 
 
-def crear_individuo(secuencia: Optional[List[int]] = None, sin_split: bool = False) -> dict:
+def crear_individuo(orden: Optional[List[str]] = None, k_fijo: Optional[int] = None,
+                    iguales: bool = False) -> dict:
     """
-    secuencia     : orden de entrada de los trabajos a la primera etapa
-    k_por_etapa   : k_por_etapa[j][s] = número de sublotes del trabajo j en la etapa s
-    proporciones  : proporciones[j][s] = fracción del lote en cada sublote
+    orden   : si se da, los sublotes de cada trabajo van seguidos en ese orden;
+              si no, las posiciones de los sublotes son aleatorias (escenario S2)
+    k_fijo  : número de sublotes para todos los trabajos (None → aleatorio)
+    iguales : sublotes de igual tamaño (si no, tamaños aleatorios)
     """
-    if secuencia is None:
-        secuencia = list(TRABAJOS)
+    k = {j: min(k_fijo, max_sublotes(j)) if k_fijo else random.randint(1, max_sublotes(j))
+         for j in TRABAJOS}
+    tamanos = {j: [1.0 / k[j]] * k[j] if iguales else _dirichlet(k[j]) for j in TRABAJOS}
+    if orden is not None:
+        secuencia = [j for j in orden for _ in range(k[j])]
+    else:
+        secuencia = [j for j in TRABAJOS for _ in range(k[j])]
         random.shuffle(secuencia)
-    k_por_etapa, proporciones = {}, {}
-    for j in TRABAJOS:
-        k_por_etapa[j], proporciones[j] = {}, {}
-        for s in ETAPAS:
-            k = 1 if sin_split else random.randint(1, _max_k_valido(j, s))
-            k_por_etapa[j][s] = k
-            proporciones[j][s] = _dirichlet(k)
-    return {'secuencia': list(secuencia), 'k_por_etapa': k_por_etapa,
-            'proporciones': proporciones}
+    return {'secuencia': secuencia, 'k': k, 'tamanos': tamanos}
 
 # ---------------------------------------------------------------------------
-# 5.  SIMULADOR HFS CON LOT STREAMING POR ETAPA (decodificador del AG)
+# 6.  SIMULADOR HFS CON SUBLOTES CONSISTENTES (decodificador del AG)
 # ---------------------------------------------------------------------------
 
-def _tiempo_disponible(curva: List[Tuple[float, float]], volumen: float) -> float:
+def simular_hfs(individuo: dict) -> Tuple[Dict[str, float], Dict[int, list]]:
     """
-    curva: [(instante, docenas que quedan disponibles en ese instante), ...]
-    Devuelve el primer instante en que el volumen acumulado disponible
-    alcanza 'volumen'.
-    """
-    acumulado = 0.0
-    for t, d in curva:
-        acumulado += d
-        if acumulado >= volumen - EPS:
-            return t
-    return curva[-1][0]
+    Simula el HFS con sublotes consistentes.
 
-
-def simular_hfs(individuo: dict) -> Tuple[Dict[int, float], Dict[int, list]]:
-    """
-    Simula el HFS con sublotes independientes por etapa.
-
-    - Los trabajos entran en el orden de 'secuencia' y en cada etapa sus
-      sublotes se programan en ese mismo orden.
-    - Un sublote de la etapa s puede empezar cuando la etapa anterior ya
-      entregó todo el volumen acumulado que necesita (la etapa anterior
-      entrega material al terminar cada uno de sus sublotes).
-    - Cada sublote se asigna a la máquina que lo TERMINA más temprano
-      (considera la disponibilidad y la velocidad de cada máquina).
+    - Etapa 1: los sublotes se procesan en el orden del cromosoma.
+    - Etapas siguientes: en orden de llegada (fin en la etapa anterior);
+      empates → posición en el cromosoma.
+    - Un sublote empieza en la etapa s cuando ese MISMO sublote terminó en la
+      etapa s−1 (el tamaño del sublote no cambia entre etapas).
+    - Cada sublote va a la máquina capaz que lo TERMINA más temprano.
 
     Retorna
     -------
-    C     : {trabajo: tiempo de terminación en la última etapa}
-    gantt : {etapa: [(trabajo, sublote, maquina_idx, inicio, fin, docenas), ...]}
+    C     : {trabajo: terminación de su último sublote en la última etapa}
+    gantt : {etapa: [(trabajo, sublote, maquina_idx, inicio, fin, pares), ...]}
     """
-    maq_libre = {s: [0.0] * MAQUINAS_POR_ETAPA[s] for s in ETAPAS}
-    C: Dict[int, float] = {}
+    tam = {j: tamanos_pares(j, individuo['tamanos'][j]) for j in TRABAJOS}
+    orden, n = [], {j: 0 for j in TRABAJOS}
+    for pos, j in enumerate(individuo['secuencia']):
+        n[j] += 1
+        orden.append((j, n[j], pos))
+    listo = {(j, b): RELEASE[j] for j, b, _ in orden}
     gantt: Dict[int, list] = {s: [] for s in ETAPAS}
 
-    for j in individuo['secuencia']:
-        # Al inicio todo el lote está disponible en la fecha de liberación
-        curva = [(RELEASE[j], docenas(DEMANDA[j]))]
+    for s in ETAPAS:
+        libre = [0.0] * MAQUINAS_POR_ETAPA[s]
+        if s != ETAPAS[0]:
+            orden.sort(key=lambda x: (listo[(x[0], x[1])], x[2]))
+        for j, b, _ in orden:
+            q = tam[j][b - 1]
+            t0 = listo[(j, b)]
+            mejor_m, mejor_ini, mejor_fin = -1, 0.0, math.inf
+            for m, h in RAPIDEZ[j][s]:
+                ini = t0 if t0 > libre[m] else libre[m]
+                fin = ini + h * q
+                if fin < mejor_fin - EPS:
+                    mejor_m, mejor_ini, mejor_fin = m, ini, fin
+            libre[mejor_m] = mejor_fin
+            listo[(j, b)] = mejor_fin
+            gantt[s].append((j, b, mejor_m, mejor_ini, mejor_fin, q))
 
-        for s in ETAPAS:
-            docs = props_a_docenas(j, individuo['proporciones'][j][s])
-            curva.sort()
-            entregas = []
-            vol_acum = 0.0
-            for b, d in enumerate(docs):
-                vol_acum += d
-                t_listo = _tiempo_disponible(curva, vol_acum)
-
-                mejor_m, mejor_ini, mejor_fin = None, 0.0, math.inf
-                for m in range(MAQUINAS_POR_ETAPA[s]):
-                    ini = max(t_listo, maq_libre[s][m])
-                    fin = ini + tiempo_horas(j, s, d, factor_maquina(s, m))
-                    if fin < mejor_fin - EPS:
-                        mejor_m, mejor_ini, mejor_fin = m, ini, fin
-
-                maq_libre[s][mejor_m] = mejor_fin
-                entregas.append((mejor_fin, d))
-                gantt[s].append((j, b + 1, mejor_m, mejor_ini, mejor_fin, d))
-            curva = entregas
-
-        C[j] = max(t for t, _ in curva)
-
+    C = {j: max(listo[(j, b)] for b in range(1, len(tam[j]) + 1)) for j in TRABAJOS}
     return C, gantt
 
 
-def simular_sin_ls(secuencia: List[int]) -> Tuple[Dict[int, float], Dict[int, list]]:
-    """HFS de permutación sin lot streaming (k = 1 en todas las etapas)."""
-    return simular_hfs(crear_individuo(secuencia, sin_split=True))
+def simular_sin_ls(orden: List[str]) -> Tuple[Dict[str, float], Dict[int, list]]:
+    """HFS de permutación sin lot streaming (un solo sublote por lote)."""
+    return simular_hfs(crear_individuo(orden, k_fijo=1))
 
 
-def verificar_programa(gantt: Dict[int, list], usar_factores: Optional[bool] = None) -> List[str]:
+def verificar_programa(gantt: Dict[int, list]) -> List[str]:
     """
     Revisa un programa de forma independiente del simulador. Comprueba:
       1. Ninguna máquina procesa dos sublotes a la vez.
       2. En cada etapa se procesa exactamente la demanda de cada trabajo.
-      3. Duración = min/docena × factor de la máquina × docenas / 60.
-      4. Ningún sublote empieza antes de la liberación del trabajo ni antes
-         de que la etapa anterior haya terminado el volumen que necesita.
+      3. La máquina puede procesar el producto y la duración es
+         min/docena × docenas / 60.
+      4. Ningún sublote empieza antes de la liberación del trabajo.
+      5. Sublotes consistentes: cada sublote tiene el mismo tamaño en todas
+         las etapas y no empieza en la etapa s antes de terminar en la s−1.
     Retorna la lista de errores (vacía = programa factible).
     """
-    usar_factores = USAR_FACTORES if usar_factores is None else usar_factores
     errores = []
+    fin_anterior: Dict[Tuple[str, int], float] = {}
+    tam_anterior: Dict[Tuple[str, int], float] = {}
     for s in ETAPAS:
         por_maquina: Dict[int, list] = {}
-        for (j, b, m, ini, fin, d) in gantt[s]:
+        volumen = {j: 0.0 for j in TRABAJOS}
+        fin_actual, tam_actual = {}, {}
+        for (j, b, m, ini, fin, q) in gantt[s]:
+            etq = f"{j}-S{b} en {NOMBRE_ETAPA[s]}"
             por_maquina.setdefault(m, []).append((ini, fin, j, b))
-            f = MAQUINAS[s][m]['factor'] if usar_factores else 1.0
-            if abs((fin - ini) - tiempo_horas(j, s, d, f)) > 1e-6:
-                errores.append(f"Duración incorrecta: T{j}-S{b} en {NOMBRE_ETAPA[s]}")
+            volumen[j] += q
+            if MAQUINAS[s][m] not in TIEMPO_MIN_DOCENA[PRODUCTO[j]]:
+                errores.append(f"{etq}: la máquina {MAQUINAS[s][m]} no procesa {PRODUCTO[j]}")
+            elif abs((fin - ini) - tiempo_horas(j, s, m, q)) > 1e-6:
+                errores.append(f"Duración incorrecta: {etq}")
             if ini < RELEASE[j] - EPS:
-                errores.append(f"T{j}-S{b} inicia antes de su liberación en {NOMBRE_ETAPA[s]}")
+                errores.append(f"{etq} inicia antes de su liberación")
+            if s != ETAPAS[0]:
+                if (j, b) not in fin_anterior:
+                    errores.append(f"{etq} no pasó por la etapa anterior")
+                else:
+                    if abs(tam_anterior[(j, b)] - q) > 1e-6:
+                        errores.append(f"{etq}: el tamaño cambia entre etapas (no consistente)")
+                    if ini < fin_anterior[(j, b)] - EPS:
+                        errores.append(f"{etq} inicia antes de terminar en la etapa anterior")
+            fin_actual[(j, b)], tam_actual[(j, b)] = fin, q
         for m, ops in por_maquina.items():
             ops.sort()
-            for a, b in zip(ops, ops[1:]):
-                if b[0] < a[1] - EPS:
-                    errores.append(f"Traslape en {NOMBRE_ETAPA[s]} {MAQUINAS[s][m]['id']}: "
-                                   f"T{a[2]}-S{a[3]} y T{b[2]}-S{b[3]}")
+            for a, c in zip(ops, ops[1:]):
+                if c[0] < a[1] - EPS:
+                    errores.append(f"Traslape en {NOMBRE_ETAPA[s]} {MAQUINAS[s][m]}: "
+                                   f"{a[2]}-S{a[3]} y {c[2]}-S{c[3]}")
         for j in TRABAJOS:
-            subs = sorted((x for x in gantt[s] if x[0] == j), key=lambda x: x[1])
-            if abs(sum(x[5] for x in subs) - docenas(DEMANDA[j])) > 1e-6:
-                errores.append(f"T{j}: el volumen en {NOMBRE_ETAPA[s]} no suma la demanda")
-            if s == ETAPAS[0]:
-                continue
-            previos = [x for x in gantt[ETAPAS[ETAPAS.index(s) - 1]] if x[0] == j]
-            acumulado = 0.0
-            for x in subs:
-                acumulado += x[5]
-                listo = sum(y[5] for y in previos if y[4] <= x[3] + EPS)
-                if listo < acumulado - 1e-6:
-                    errores.append(f"T{j}-S{x[1]} en {NOMBRE_ETAPA[s]} inicia sin material "
-                                   f"suficiente de la etapa anterior")
+            if abs(volumen[j] - DEMANDA[j]) > 1e-6:
+                errores.append(f"{j}: el volumen en {NOMBRE_ETAPA[s]} no suma la demanda")
+        fin_anterior, tam_anterior = fin_actual, tam_actual
     return errores
 
 # ---------------------------------------------------------------------------
-# 6.  SIMULADOR DE REGLAS DE DESPACHO (sin lot streaming, como LEKIN)
+# 7.  SIMULADOR DE REGLAS DE DESPACHO (sin lot streaming, como LEKIN)
 # ---------------------------------------------------------------------------
 
 REGLAS = ["EDD", "SPT", "LPT", "FIFO", "LIFO", "MS", "CR"]
 
 
 def simular_despacho(regla: str,
-                     trabajos: Optional[List[int]] = None,
-                     p: Optional[Dict[int, Dict[int, float]]] = None,
-                     due: Optional[Dict[int, float]] = None,
-                     rel: Optional[Dict[int, float]] = None,
-                     usar_factores: Optional[bool] = None
-                     ) -> Tuple[Dict[int, float], Dict[int, list]]:
+                     trabajos: Optional[List[str]] = None,
+                     p_maq: Optional[Dict[str, Dict[int, List[Tuple[int, float]]]]] = None,
+                     due: Optional[Dict[str, float]] = None,
+                     rel: Optional[Dict[str, float]] = None
+                     ) -> Tuple[Dict[str, float], Dict[int, list]]:
     """
     Programación no-delay por reglas de despacho, lote completo (sin LS).
 
     Cada vez que una máquina queda libre y hay trabajos esperando en su
     etapa, se elige el trabajo de mayor prioridad según la regla y se asigna
-    a la máquina que lo termina primero. Prioridades:
+    a la máquina capaz que lo termina primero. Prioridades (con el tiempo
+    promedio de la operación en las máquinas capaces de la etapa):
       EDD  : menor fecha de entrega
       SPT  : menor tiempo de la operación en la etapa
       LPT  : mayor tiempo de la operación en la etapa
@@ -457,24 +589,22 @@ def simular_despacho(regla: str,
       LIFO : el que llegó último a la cola de la etapa
       MS   : menor holgura  (d_j − t − trabajo restante)
       CR   : menor razón crítica (d_j − t) / trabajo restante
-    Empates → menor número de trabajo (LIFO: mayor).
+    Empates → orden de la hoja Trabajos (LIFO: el último).
 
-    Los argumentos opcionales permiten usar otros datos (p. ej. los minutos
-    enteros de LEKIN). p está en horas en una máquina de factor 1.
+    p_maq[j][s] = [(máquina, horas del lote completo), …]; los argumentos
+    opcionales permiten usar otros datos (p. ej. los minutos enteros de LEKIN).
     """
     trabajos = list(trabajos or TRABAJOS)
-    p = p or calcular_tiempos_completos()
+    p_maq = p_maq or tiempos_lote_completo()
     due = due or DUE_DATE
     rel = rel or RELEASE
-    usar_factores = USAR_FACTORES if usar_factores is None else usar_factores
-    fac = {s: [MAQUINAS[s][m]['factor'] if usar_factores else 1.0
-               for m in range(MAQUINAS_POR_ETAPA[s])] for s in ETAPAS}
+    p = {j: {s: tiempo_promedio(p_maq[j][s]) for s in ETAPAS} for j in trabajos}
 
     orden = {j: i for i, j in enumerate(trabajos)}
     maq_libre = {s: [0.0] * MAQUINAS_POR_ETAPA[s] for s in ETAPAS}
     idx_etapa = {j: 0 for j in trabajos}            # índice de la próxima etapa
     listo = {j: rel[j] for j in trabajos}           # llegada a la cola actual
-    C: Dict[int, float] = {}
+    C: Dict[str, float] = {}
     gantt: Dict[int, list] = {s: [] for s in ETAPAS}
 
     def restante(j, s):
@@ -504,22 +634,21 @@ def simular_despacho(regla: str,
         t_min, s_min = math.inf, None
         for j in pendientes:
             s = ETAPAS[idx_etapa[j]]
-            t = max(listo[j], min(maq_libre[s]))
+            t = max(listo[j], min(maq_libre[s][m] for m, _ in p_maq[j][s]))
             if t < t_min - EPS or (abs(t - t_min) <= EPS and s < s_min):
                 t_min, s_min = t, s
         s = s_min
         cola = [j for j in pendientes
-                if ETAPAS[idx_etapa[j]] == s and listo[j] <= t_min + EPS]
+                if ETAPAS[idx_etapa[j]] == s and listo[j] <= t_min + EPS
+                and min(maq_libre[s][m] for m, _ in p_maq[j][s]) <= t_min + EPS]
         j = min(cola, key=lambda x: prioridad(x, s, t_min))
-        # Máquina que TERMINA primero la operación (con máquinas idénticas es
-        # la que está libre en t_min; con velocidades distintas puede convenir
-        # esperar un poco a una máquina rápida)
-        m = min(range(MAQUINAS_POR_ETAPA[s]),
-                key=lambda x: (max(t_min, maq_libre[s][x]) + p[j][s] * fac[s][x], x))
+        # Máquina capaz que TERMINA primero la operación (con velocidades
+        # distintas puede convenir esperar un poco a una máquina rápida)
+        m, dur = min(p_maq[j][s], key=lambda x: (max(t_min, maq_libre[s][x[0]]) + x[1], x[0]))
         ini = max(t_min, maq_libre[s][m])
-        fin = ini + p[j][s] * fac[s][m]
+        fin = ini + dur
         maq_libre[s][m] = fin
-        gantt[s].append((j, 1, m, ini, fin, docenas(DEMANDA[j])))
+        gantt[s].append((j, 1, m, ini, fin, DEMANDA[j]))
 
         idx_etapa[j] += 1
         listo[j] = fin
@@ -530,24 +659,23 @@ def simular_despacho(regla: str,
     return C, gantt
 
 # ---------------------------------------------------------------------------
-# 7.  FUNCIÓN OBJETIVO E INDICADORES
+# 8.  FUNCIÓN OBJETIVO E INDICADORES
 # ---------------------------------------------------------------------------
 
-def calcular_indicadores(C: Dict[int, float],
-                         due: Optional[Dict[int, float]] = None,
-                         rel: Optional[Dict[int, float]] = None) -> Dict:
+def calcular_indicadores(C: Dict[str, float],
+                         due: Optional[Dict[str, float]] = None,
+                         rel: Optional[Dict[str, float]] = None) -> Dict:
     """Indicadores estándar de scheduling para los trabajos de C."""
     due = due or DUE_DATE
     rel = rel or RELEASE
-    trabajos = list(C)
     ind_j = {}
-    for j in trabajos:
+    for j in C:
         ci, di, ri = C[j], due[j], rel[j]
         li = ci - di
         ti = max(0.0, li)
         ind_j[j] = {'Ci': ci, 'ri': ri, 'di': di, 'Fi': ci - ri, 'Li': li, 'Ti': ti,
                     'Ei': max(0.0, -li), 'delta_i': 1 if ti > EPS else 0}
-    n = len(trabajos)
+    n = len(C)
     return {
         'por_trabajo': ind_j,
         'Cmax'     : max(C.values()),
@@ -575,107 +703,107 @@ def fitness(individuo: dict) -> Tuple[float, float]:
     return individuo['_fitness']
 
 # ---------------------------------------------------------------------------
-# 8.  OPERADORES GENÉTICOS
+# 9.  OPERADORES GENÉTICOS
 # ---------------------------------------------------------------------------
 
 def seleccion_torneo(poblacion: List[dict], tam: int) -> dict:
     return min(random.sample(poblacion, tam), key=fitness)
 
 
-def cruce_ox(seq1: List[int], seq2: List[int]) -> List[int]:
-    """Cruce de orden OX: conserva una permutación válida."""
-    n = len(seq1)
-    p1, p2 = sorted(random.sample(range(n), 2))
-    hijo = [None] * n
-    hijo[p1:p2 + 1] = seq1[p1:p2 + 1]
-    usados = set(hijo[p1:p2 + 1])
-    pos = (p2 + 1) % n
-    for gen in seq2[p2 + 1:] + seq2[:p2 + 1]:
-        if gen not in usados:
-            hijo[pos] = gen
-            usados.add(gen)
-            pos = (pos + 1) % n
-    return hijo
-
-
-def _ajustar_props(ref: List[float], otro: List[float], k: int) -> List[float]:
-    """k proporciones obtenidas al promediar 'ref' y 'otro' adaptados a longitud k."""
-    def adaptar(lst):
-        r = lst[:k] if len(lst) >= k else lst + [lst[-1]] * (k - len(lst))
-        t = sum(r)
-        return [x / t for x in r] if t > 0 else _dirichlet(k)
-
-    mezcla = [(a + b) / 2.0 for a, b in zip(adaptar(ref), adaptar(otro))]
-    t = sum(mezcla)
-    return [x / t for x in mezcla] if t > 0 else _dirichlet(k)
+def _cruce_un_hijo(padre: dict, madre: dict, de_padre: set) -> dict:
+    """
+    Cruce por trabajos (tipo POX) para la permutación con repetición: los
+    sublotes de los trabajos de 'de_padre' conservan sus posiciones relativas
+    del padre; los demás se intercalan en el orden de la madre. Cada trabajo
+    hereda k y tamaños del MISMO progenitor que le da sus posiciones, así el
+    hijo siempre tiene tantas posiciones como sublotes.
+    """
+    lp, lm = len(padre['secuencia']), len(madre['secuencia'])
+    genes = [((i + 0.5) / lp, 0, j) for i, j in enumerate(padre['secuencia']) if j in de_padre]
+    genes += [((i + 0.5) / lm, 1, j) for i, j in enumerate(madre['secuencia'])
+              if j not in de_padre]
+    genes.sort()
+    origen = {j: (padre if j in de_padre else madre) for j in TRABAJOS}
+    return {'secuencia': [j for _, _, j in genes],
+            'k': {j: origen[j]['k'][j] for j in TRABAJOS},
+            'tamanos': {j: list(origen[j]['tamanos'][j]) for j in TRABAJOS}}
 
 
 def cruce(p1: dict, p2: dict) -> Tuple[dict, dict]:
-    """Cruce de secuencia (OX) y cruce uniforme de k y proporciones por (j, s)."""
-    h1, h2 = copy.deepcopy(p1), copy.deepcopy(p2)
-    h1.pop('_fitness', None)
-    h2.pop('_fitness', None)
-
-    h1['secuencia'] = cruce_ox(p1['secuencia'], p2['secuencia'])
-    h2['secuencia'] = cruce_ox(p2['secuencia'], p1['secuencia'])
-
-    for j in TRABAJOS:
-        for s in ETAPAS:
-            if random.random() < 0.5:
-                h1['k_por_etapa'][j][s] = p2['k_por_etapa'][j][s]
-                h2['k_por_etapa'][j][s] = p1['k_por_etapa'][j][s]
-            k1, k2 = h1['k_por_etapa'][j][s], h2['k_por_etapa'][j][s]
-            h1['proporciones'][j][s] = _ajustar_props(
-                p1['proporciones'][j][s], p2['proporciones'][j][s], k1)
-            h2['proporciones'][j][s] = _ajustar_props(
-                p2['proporciones'][j][s], p1['proporciones'][j][s], k2)
-    return h1, h2
+    """Cruce por subconjunto aleatorio de trabajos; produce dos hijos simétricos."""
+    n = len(TRABAJOS)
+    conjunto = set(random.sample(TRABAJOS, random.randint(1, n - 1)))
+    return _cruce_un_hijo(p1, p2, conjunto), _cruce_un_hijo(p2, p1, conjunto)
 
 
 def mutar(individuo: dict) -> dict:
-    """Mutación de secuencia (swap), proporciones (gaussiana) y k (±1)."""
+    """
+    Mutación:
+      - posiciones: intercambio (swap) de dos sublotes de trabajos distintos
+      - tamaños   : perturbación gaussiana de una proporción (igual en todas
+                    las etapas, el sublote sigue siendo consistente)
+      - k         : se agrega o quita un sublote (y su posición)
+    """
     ind = copy.deepcopy(individuo)
     ind.pop('_fitness', None)
+    seq = ind['secuencia']
 
-    if random.random() < GA_PARAMS['prob_mut_seq']:
-        a, b = random.sample(range(len(ind['secuencia'])), 2)
-        ind['secuencia'][a], ind['secuencia'][b] = ind['secuencia'][b], ind['secuencia'][a]
+    if random.random() < GA_PARAMS['prob_mut_seq'] and len(set(seq)) > 1:
+        while True:
+            a, b = random.sample(range(len(seq)), 2)
+            if seq[a] != seq[b]:
+                break
+        seq[a], seq[b] = seq[b], seq[a]
 
     for j in TRABAJOS:
-        for s in ETAPAS:
-            if random.random() < GA_PARAMS['prob_mut_prop']:
-                props = ind['proporciones'][j][s][:]
-                idx = random.randrange(len(props))
-                props[idx] = max(1e-9, props[idx] + random.gauss(0, 0.15))
-                t = sum(props)
-                ind['proporciones'][j][s] = [x / t for x in props]
+        props = ind['tamanos'][j]
+        if random.random() < GA_PARAMS['prob_mut_tam'] and len(props) > 1:
+            i = random.randrange(len(props))
+            props[i] = max(1e-9, props[i] + random.gauss(0, 0.15))
+            t = sum(props)
+            ind['tamanos'][j] = [x / t for x in props]
 
-            if random.random() < GA_PARAMS['prob_mut_k']:
-                k_actual = ind['k_por_etapa'][j][s]
-                k_nuevo = max(1, min(_max_k_valido(j, s), k_actual + random.choice([-1, 1])))
-                if k_nuevo != k_actual:
-                    ind['k_por_etapa'][j][s] = k_nuevo
-                    ind['proporciones'][j][s] = _ajustar_props(
-                        ind['proporciones'][j][s], _dirichlet(k_nuevo), k_nuevo)
+        if random.random() < GA_PARAMS['prob_mut_k']:
+            k_act = ind['k'][j]
+            k_nuevo = max(1, min(max_sublotes(j), k_act + random.choice([-1, 1])))
+            if k_nuevo > k_act:
+                # El sublote más grande se parte en dos; el nuevo va a una posición al azar
+                props = ind['tamanos'][j]
+                i = max(range(k_act), key=lambda x: props[x])
+                props[i] /= 2.0
+                props.append(props[i])
+                seq.insert(random.randint(0, len(seq)), j)
+            elif k_nuevo < k_act:
+                # Un sublote al azar se une a otro; se quita una posición de j
+                props = ind['tamanos'][j]
+                quitado = props.pop(random.randrange(k_act))
+                props[random.randrange(len(props))] += quitado
+                posiciones = [p for p, x in enumerate(seq) if x == j]
+                del seq[random.choice(posiciones)]
+            ind['k'][j] = k_nuevo
     return ind
 
 # ---------------------------------------------------------------------------
-# 9.  ALGORITMO GENÉTICO PRINCIPAL
+# 10. ALGORITMO GENÉTICO PRINCIPAL
 # ---------------------------------------------------------------------------
 
-def algoritmo_genetico(semillas: Optional[List[List[int]]] = None,
+def algoritmo_genetico(semillas: Optional[List[List[str]]] = None,
                        verbose: bool = True) -> Tuple[dict, List[float]]:
     """
     Ejecuta el AG y retorna (mejor_individuo, historial del mejor ΣTi).
 
-    semillas: secuencias que se insertan en la población inicial sin lot
-    streaming (p. ej. las de las reglas de despacho). Así el AG nunca
-    termina peor que esas secuencias.
+    La población inicial es aleatoria (escenario S2: tamaños de sublote y
+    posiciones aleatorios). 'semillas' son órdenes de trabajos (p. ej. de las
+    reglas de despacho) que se insertan sin lot streaming y con sublotes
+    iguales; así el AG nunca termina peor que esas secuencias.
     """
     if GA_PARAMS['semilla'] is not None:
         random.seed(GA_PARAMS['semilla'])
 
-    poblacion = [crear_individuo(seq, sin_split=True) for seq in (semillas or [])]
+    poblacion = []
+    for orden in semillas or []:
+        poblacion.append(crear_individuo(orden, k_fijo=1))
+        poblacion.append(crear_individuo(orden, k_fijo=MAX_SUBLOTES, iguales=True))
     poblacion = poblacion[:GA_PARAMS['poblacion']]
     while len(poblacion) < GA_PARAMS['poblacion']:
         poblacion.append(crear_individuo())
@@ -684,12 +812,14 @@ def algoritmo_genetico(semillas: Optional[List[List[int]]] = None,
 
     mejor_global = copy.deepcopy(min(poblacion, key=fitness))
     historial = []
+    tam_torneo = min(GA_PARAMS['tam_torneo'], GA_PARAMS['poblacion'])
 
     if verbose:
         print(f"\n{'=' * 72}")
-        print("  ALGORITMO GENÉTICO — HFS CON LOT STREAMING POR ETAPA")
-        print(f"  Población: {GA_PARAMS['poblacion']}  |  "
-              f"Generaciones: {GA_PARAMS['generaciones']}  |  MAX_SPLIT: {MAX_SPLIT}")
+        print("  ALGORITMO GENÉTICO — HFS CON SUBLOTES CONSISTENTES (escenario S2)")
+        print(f"  Población: {GA_PARAMS['poblacion']}  |  Generaciones: "
+              f"{GA_PARAMS['generaciones']}  |  Máx. sublotes: {MAX_SUBLOTES}  |  "
+              f"Mín. sublote: {MIN_PARES_SUBLOTE} pares")
         print("  Máquinas: " + " | ".join(f"{NOMBRE_ETAPA[s]}={MAQUINAS_POR_ETAPA[s]}"
                                           for s in ETAPAS))
         print(f"{'=' * 72}")
@@ -703,8 +833,8 @@ def algoritmo_genetico(semillas: Optional[List[List[int]]] = None,
             nueva.append(copy.deepcopy(min(poblacion, key=fitness)))
 
         while len(nueva) < GA_PARAMS['poblacion']:
-            p1 = seleccion_torneo(poblacion, GA_PARAMS['tam_torneo'])
-            p2 = seleccion_torneo(poblacion, GA_PARAMS['tam_torneo'])
+            p1 = seleccion_torneo(poblacion, tam_torneo)
+            p2 = seleccion_torneo(poblacion, tam_torneo)
             if random.random() < GA_PARAMS['prob_cruce']:
                 h1, h2 = cruce(p1, p2)
             else:
@@ -733,7 +863,7 @@ def algoritmo_genetico(semillas: Optional[List[List[int]]] = None,
     return mejor_global, historial
 
 # ---------------------------------------------------------------------------
-# 10. REFERENCIAS: REGLAS DE DESPACHO Y ENUMERACIÓN EXACTA
+# 11. REFERENCIAS: REGLAS DE DESPACHO Y ENUMERACIÓN EXACTA
 # ---------------------------------------------------------------------------
 
 def evaluar_reglas() -> List[dict]:
@@ -764,23 +894,29 @@ def enumeracion_sin_ls() -> Optional[dict]:
     return mejor
 
 # ---------------------------------------------------------------------------
-# 11. VALIDACIÓN CON LEKIN
+# 12. VALIDACIÓN CON LEKIN
 # ---------------------------------------------------------------------------
 
-def datos_lekin() -> Tuple[List[int], pd.DataFrame, Dict]:
+def datos_lekin() -> Tuple[List[str], pd.DataFrame, Dict]:
     """
     Datos para cargar en LEKIN (Flexible Flow Shop), en MINUTOS ENTEROS:
-    tiempo de procesamiento del lote completo en cada etapa (workcenter),
-    fecha de liberación, fecha de entrega y peso = 1.
+    tiempo del lote completo en cada etapa (workcenter) con el PROMEDIO de
+    min/docena de las máquinas capaces (máquinas idénticas), fecha de
+    liberación, fecha de entrega y peso = 1.
     """
     trabajos = TRABAJOS[:MAX_TRABAJOS_LEKIN]
-    p_min = {j: {s: int(round(TIEMPO_MIN_DOCENA[j][s] * docenas(DEMANDA[j]))) for s in ETAPAS}
-             for j in trabajos}
+    p_min = {}
+    for j in trabajos:
+        tiempos = TIEMPO_MIN_DOCENA[PRODUCTO[j]]
+        p_min[j] = {s: int(round(docenas(DEMANDA[j]) *
+                                 tiempo_promedio([(m, tiempos[MAQUINAS[s][m]])
+                                                  for m, _ in RAPIDEZ[j][s]])))
+                    for s in ETAPAS}
     due_min = {j: int(round(DUE_DATE[j] * 60)) for j in trabajos}
     rel_min = {j: int(round(RELEASE[j] * 60)) for j in trabajos}
     filas = []
     for j in trabajos:
-        fila = {'Job': f"J{j:02d}", 'Descripcion': DESCRIPCION[j],
+        fila = {'Job': j, 'Producto': PRODUCTO[j],
                 'Release (min)': rel_min[j], 'Due (min)': due_min[j], 'Weight': 1}
         for s in ETAPAS:
             fila[f"W{s} {NOMBRE_ETAPA[s]} ({MAQUINAS_POR_ETAPA[s]} maq) [min]"] = p_min[j][s]
@@ -795,13 +931,13 @@ def validacion_lekin() -> Tuple[pd.DataFrame, pd.DataFrame]:
     coincidir con los que muestra LEKIN para la misma regla.
     """
     trabajos, tabla, d = datos_lekin()
-    p_h = {j: {s: d['p'][j][s] / 60.0 for s in ETAPAS} for j in trabajos}
+    p_maq = {j: {s: [(m, d['p'][j][s] / 60.0) for m, _ in RAPIDEZ[j][s]] for s in ETAPAS}
+             for j in trabajos}
     filas = []
     for regla in REGLAS:
-        C_h, _ = simular_despacho(regla, trabajos, p=p_h,
+        C_h, _ = simular_despacho(regla, trabajos, p_maq=p_maq,
                                   due={j: d['due'][j] / 60.0 for j in trabajos},
-                                  rel={j: d['rel'][j] / 60.0 for j in trabajos},
-                                  usar_factores=False)
+                                  rel={j: d['rel'][j] / 60.0 for j in trabajos})
         C = {j: round(C_h[j] * 60) for j in trabajos}
         ind = calcular_indicadores(C, due=d['due'], rel=d['rel'])
         filas.append({'Regla': regla, 'Cmax': ind['Cmax'], 'Lmax': ind['Lmax'],
@@ -810,11 +946,16 @@ def validacion_lekin() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return tabla, pd.DataFrame(filas)
 
 # ---------------------------------------------------------------------------
-# 12. REPORTES EN CONSOLA
+# 13. REPORTES EN CONSOLA
 # ---------------------------------------------------------------------------
 
 SEP = "=" * 76
 SEP2 = "-" * 76
+
+
+def _fmt_fecha(h: float) -> str:
+    f = horas_a_fecha(h)
+    return f.isoformat() if f else ("fuera de calendario" if CALENDARIO else "")
 
 
 def imprimir_datos():
@@ -822,25 +963,35 @@ def imprimir_datos():
     print("  DATOS LEÍDOS DEL EXCEL")
     print(SEP)
     for s in ETAPAS:
-        grupos = {}
-        for m in MAQUINAS[s]:
-            grupos.setdefault(m['grupo'], [0, m['factor']])[0] += 1
-        detalle = ", ".join(f"{g}: {n} maq × factor {f:.2f}" for g, (n, f) in grupos.items())
-        print(f"  Etapa {s} {NOMBRE_ETAPA[s]:<12} → {detalle}")
-    if not USAR_FACTORES:
-        print("  (Usar_factores_velocidad = No → todas las máquinas se tratan como idénticas)")
+        maq = MAQUINAS[s]
+        print(f"  Etapa {s} {NOMBRE_ETAPA[s]:<12} → {len(maq)} máquinas ({maq[0]}…{maq[-1]})")
+    if CALENDARIO:
+        print(f"  Calendario: {CALENDARIO[0][0]} a {CALENDARIO[-1][0]} "
+              f"({CALENDARIO[-1][2]:.0f} h laborables)")
     print()
     print(SEP)
-    print("  TIEMPOS DE PROCESAMIENTO — LOTE COMPLETO EN MÁQUINA ESTÁNDAR [horas]")
+    print("  TIEMPOS POR PRODUCTO [min/docena] (mín–máx entre las máquinas de la etapa)")
     print(SEP)
-    enc = " | ".join(f"{NOMBRE_ETAPA[s][:10]:>10}" for s in ETAPAS)
-    print(f"  {'Trab':>4} | {'Docenas':>8} | {'di(h)':>6} | {enc} | {'Total':>8}")
+    print(f"  {'Prod':>5} | " + " | ".join(f"{NOMBRE_ETAPA[s][:11]:>11}" for s in ETAPAS))
     print(SEP2)
-    p = calcular_tiempos_completos()
+    for prod in sorted({PRODUCTO[j] for j in TRABAJOS}):
+        celdas = []
+        for s in ETAPAS:
+            t = [TIEMPO_MIN_DOCENA[prod][m] for m in MAQUINAS[s] if m in TIEMPO_MIN_DOCENA[prod]]
+            celdas.append(f"{min(t):>5.2f}–{max(t):<5.2f}" if min(t) != max(t)
+                          else f"{min(t):>11.2f}")
+        print(f"  {prod:>5} | " + " | ".join(celdas))
+    print()
+    print(SEP)
+    print("  TRABAJOS")
+    print(SEP)
+    print(f"  {'OT':>4} | {'Prod':>5} | {'Pares':>6} | {'Docenas':>7} | {'ri(h)':>6} | "
+          f"{'di(h)':>6} | {'Entrega':>10}")
+    print(SEP2)
     for j in TRABAJOS:
-        e = " | ".join(f"{p[j][s]:>10.3f}" for s in ETAPAS)
-        print(f"  {j:>4} | {docenas(DEMANDA[j]):>8.2f} | {DUE_DATE[j]:>6.1f} | {e} | "
-              f"{sum(p[j].values()):>8.3f}")
+        fe = FECHA_ENTREGA[j].isoformat() if FECHA_ENTREGA[j] else ""
+        print(f"  {j:>4} | {PRODUCTO[j]:>5} | {DEMANDA[j]:>6} | {docenas(DEMANDA[j]):>7.2f} | "
+              f"{RELEASE[j]:>6.1f} | {DUE_DATE[j]:>6.1f} | {fe:>10}")
     print()
 
 
@@ -848,16 +999,17 @@ def imprimir_reglas(resultados: List[dict], exacto: Optional[dict]):
     print(SEP)
     print("  REGLAS DE DESPACHO — SIN LOT STREAMING (referencia)")
     print(SEP)
-    print(f"  {'Regla':>6} | {'Orden en etapa 1':>24} | {'ΣTi':>9} | {'Tmax':>9} | "
-          f"{'Cmax':>9} | {'#tard':>5}")
+    print(f"  {'Regla':>6} | {'ΣTi':>9} | {'Tmax':>9} | {'Cmax':>9} | {'#tard':>5} | "
+          f"Orden en etapa 1")
     print(SEP2)
     for r in sorted(resultados, key=lambda x: x['suma_Ti']):
-        print(f"  {r['regla']:>6} | {str(r['secuencia']):>24} | {r['suma_Ti']:>9.4f} | "
-              f"{r['Tmax']:>9.4f} | {r['Cmax']:>9.4f} | {r['num_tardy']:>5}")
+        print(f"  {r['regla']:>6} | {r['suma_Ti']:>9.4f} | {r['Tmax']:>9.4f} | "
+              f"{r['Cmax']:>9.4f} | {r['num_tardy']:>5} | {' '.join(r['secuencia'])}")
     if exacto:
         print(SEP2)
-        print(f"  {'ÓPTIMO':>6} | {str(exacto['secuencia']):>24} | {exacto['suma_Ti']:>9.4f} | "
-              f"{exacto['Tmax']:>9.4f} | {exacto['Cmax']:>9.4f} | {exacto['num_tardy']:>5}")
+        print(f"  {'ÓPTIMO':>6} | {exacto['suma_Ti']:>9.4f} | {exacto['Tmax']:>9.4f} | "
+              f"{exacto['Cmax']:>9.4f} | {exacto['num_tardy']:>5} | "
+              f"{' '.join(exacto['secuencia'])}")
         print(f"  (óptimo exacto de permutación sin LS: {exacto['evaluadas']} secuencias evaluadas)")
     print()
 
@@ -865,32 +1017,35 @@ def imprimir_reglas(resultados: List[dict], exacto: Optional[dict]):
 def tabla_sublotes(individuo: dict) -> pd.DataFrame:
     filas = []
     for j in TRABAJOS:
-        for s in ETAPAS:
-            docs = props_a_docenas(j, individuo['proporciones'][j][s])
-            for b, d in enumerate(docs, start=1):
-                filas.append({'Trabajo': j, 'Etapa': NOMBRE_ETAPA[s],
-                              'Maquinas_etapa': MAQUINAS_POR_ETAPA[s],
-                              'k_sublotes': len(docs), 'Sublote': b,
-                              'Docenas': round(d, 3), 'Pares': round(d * 12, 1)})
+        tam = tamanos_pares(j, individuo['tamanos'][j])
+        for b, q in enumerate(tam, start=1):
+            filas.append({'Trabajo': j, 'Producto': PRODUCTO[j], 'k_sublotes': len(tam),
+                          'Sublote': b, 'Pares': q, 'Docenas': round(docenas(q), 3)})
     return pd.DataFrame(filas)
 
 
 def tabla_programa(gantt: Dict[int, list]) -> pd.DataFrame:
     filas = []
     for s in ETAPAS:
-        for (j, b, m, ini, fin, d) in sorted(gantt[s], key=lambda x: (x[3], x[2])):
-            filas.append({'Etapa': NOMBRE_ETAPA[s], 'Maquina': MAQUINAS[s][m]['id'],
-                          'Grupo': MAQUINAS[s][m]['grupo'],
-                          'Factor': factor_maquina(s, m), 'Trabajo': j, 'Sublote': b,
-                          'Docenas': round(d, 3), 'Inicio_h': round(ini, 4),
-                          'Fin_h': round(fin, 4), 'Duracion_h': round(fin - ini, 4)})
+        for (j, b, m, ini, fin, q) in sorted(gantt[s], key=lambda x: (x[3], x[2])):
+            filas.append({'Etapa': NOMBRE_ETAPA[s], 'Maquina': MAQUINAS[s][m],
+                          'Trabajo': j, 'Producto': PRODUCTO[j], 'Sublote': b,
+                          'Pares': q, 'Docenas': round(docenas(q), 3),
+                          'min_x_docena': TIEMPO_MIN_DOCENA[PRODUCTO[j]][MAQUINAS[s][m]],
+                          'Inicio_h': round(ini, 4), 'Fin_h': round(fin, 4),
+                          'Duracion_h': round(fin - ini, 4),
+                          'Fecha_inicio': _fmt_fecha(ini), 'Fecha_fin': _fmt_fecha(fin)})
     return pd.DataFrame(filas)
 
 
 def tabla_indicadores(ind: dict) -> pd.DataFrame:
-    return pd.DataFrame([{'Trabajo': j, 'Descripcion': DESCRIPCION[j], **{
-        k: (round(v, 4) if isinstance(v, float) else v) for k, v in vals.items()}}
-        for j, vals in ind['por_trabajo'].items()])
+    filas = []
+    for j, vals in ind['por_trabajo'].items():
+        fe = FECHA_ENTREGA[j].isoformat() if FECHA_ENTREGA[j] else ""
+        filas.append({'Trabajo': j, 'Producto': PRODUCTO[j], 'Pares': DEMANDA[j],
+                      **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in vals.items()},
+                      'Fecha_entrega': fe, 'Fecha_terminacion': _fmt_fecha(vals['Ci'])})
+    return pd.DataFrame(filas)
 
 
 def imprimir_solucion(titulo: str, individuo: dict):
@@ -899,17 +1054,21 @@ def imprimir_solucion(titulo: str, individuo: dict):
 
     print(SEP)
     print(f"  {titulo}")
-    print(f"  Secuencia: {individuo['secuencia']}")
-    print("\n  SUBLOTES ELEGIDOS POR EL AG (k independiente por etapa):")
-    print("  " + tabla_sublotes(individuo).to_string(index=False).replace("\n", "\n  "))
+    print("  Posiciones de los sublotes (etapa 1): " + " ".join(individuo['secuencia']))
+    print("\n  SUBLOTES CONSISTENTES (mismo tamaño en todas las etapas):")
+    for j in TRABAJOS:
+        tam = tamanos_pares(j, individuo['tamanos'][j])
+        print(f"    {j} ({PRODUCTO[j]}, {DEMANDA[j]} pares): k = {len(tam)} → "
+              + " + ".join(f"{q}" for q in tam) + " pares")
 
-    print(f"\n  {'Tj':>4} | {'di(h)':>7} | {'Ci(h)':>8} | {'Fi(h)':>8} | {'Li(h)':>8} | "
-          f"{'Ti(h)':>8} | {'Ei(h)':>8} | {'δi':>3}")
-    print("  " + "-" * 70)
+    print(f"\n  {'OT':>4} | {'di(h)':>7} | {'Ci(h)':>8} | {'Fi(h)':>8} | {'Li(h)':>8} | "
+          f"{'Ti(h)':>8} | {'Ei(h)':>8} | {'δi':>3} | Terminación")
+    print("  " + "-" * 84)
     for j in TRABAJOS:
         v = ind['por_trabajo'][j]
         print(f"  {j:>4} | {v['di']:>7.1f} | {v['Ci']:>8.4f} | {v['Fi']:>8.4f} | "
-              f"{v['Li']:>8.4f} | {v['Ti']:>8.4f} | {v['Ei']:>8.4f} | {v['delta_i']:>3}")
+              f"{v['Li']:>8.4f} | {v['Ti']:>8.4f} | {v['Ei']:>8.4f} | {v['delta_i']:>3} | "
+              f"{_fmt_fecha(v['Ci'])}")
 
     print("\n  INDICADORES GLOBALES")
     print(f"    Cmax      (makespan)              = {ind['Cmax']:>10.4f} h")
@@ -920,29 +1079,12 @@ def imprimir_solucion(titulo: str, individuo: dict):
     print(f"    ΣFi       (flujo total)           = {ind['suma_Fi']:>10.4f} h")
     print(f"    F̄         (flujo medio)           = {ind['media_Fi']:>10.4f} h")
     print(f"    # tardíos (Σδi)                   = {ind['num_tardy']:>10}")
-
-    print("\n  PROGRAMA DETALLADO")
-    print("  " + tabla_programa(gantt).to_string(index=False).replace("\n", "\n  "))
-    print()
-
-
-def imprimir_utilizacion(individuo: dict):
-    print(SEP)
-    print("  USO DE MÁQUINAS POR ETAPA (solución AG)")
-    print(SEP)
-    print(f"  {'Etapa':>12} | {'Disponibles':>11} | {'Máx sublotes/trabajo':>20} | "
-          f"{'Prom sublotes/trabajo':>21}")
-    print(SEP2)
-    for s in ETAPAS:
-        k_vals = [individuo['k_por_etapa'][j][s] for j in TRABAJOS]
-        print(f"  {NOMBRE_ETAPA[s]:>12} | {MAQUINAS_POR_ETAPA[s]:>11} | {max(k_vals):>20} | "
-              f"{sum(k_vals) / len(k_vals):>21.2f}")
     print()
 
 
 def imprimir_comparacion(ind_sin: dict, ind_con: dict, nombre_sin: str):
     print(SEP)
-    print(f"  COMPARACIÓN: SIN LOT STREAMING ({nombre_sin}) vs. CON LOT STREAMING (AG)")
+    print(f"  COMPARACIÓN: SIN LOT STREAMING ({nombre_sin}) vs. SUBLOTES CONSISTENTES (AG)")
     print(SEP)
     print(f"  {'Indicador':>25} | {'Sin LS':>12} | {'Con LS':>12} | {'Δ%':>9}")
     print("  " + "-" * 66)
@@ -962,17 +1104,17 @@ def imprimir_lekin(tabla: pd.DataFrame, res: pd.DataFrame):
     if len(TRABAJOS) > MAX_TRABAJOS_LEKIN:
         print(f"  ⚠ Hay {len(TRABAJOS)} trabajos; LEKIN admite {MAX_TRABAJOS_LEKIN}. "
               f"Se usan los primeros {MAX_TRABAJOS_LEKIN} de la hoja Trabajos.")
-    print("  " + tabla.drop(columns=['Descripcion']).to_string(index=False).replace("\n", "\n  "))
+    print("  " + tabla.to_string(index=False).replace("\n", "\n  "))
     print("\n  Resultados que deben coincidir con LEKIN (mismos datos y regla) [min]:")
     print("  " + res.to_string(index=False).replace("\n", "\n  "))
     print()
 
 # ---------------------------------------------------------------------------
-# 13. DIAGRAMA DE GANTT
+# 14. DIAGRAMA DE GANTT
 # ---------------------------------------------------------------------------
 
 def graficar_gantt(individuo: dict,
-                   titulo: str = "Diagrama de Gantt — HFS con Lot Streaming",
+                   titulo: str = "Diagrama de Gantt — HFS con sublotes consistentes",
                    guardar_como: Optional[str] = None):
     C, gantt = simular_hfs(individuo)
     ind = calcular_indicadores(C)
@@ -984,26 +1126,26 @@ def graficar_gantt(individuo: dict,
 
     alturas = [MAQUINAS_POR_ETAPA[s] for s in ETAPAS]
     fig, axes = plt.subplots(len(ETAPAS), 1,
-                             figsize=(20, max(8, sum(alturas) * 0.45 + 3)),
+                             figsize=(20, max(8, sum(alturas) * 0.35 + 3)),
                              gridspec_kw={'height_ratios': alturas}, sharex=True)
     if len(ETAPAS) == 1:
         axes = [axes]
     fig.suptitle(titulo, fontsize=14, fontweight='bold', y=1.0)
-    umbral_texto = (cmax if cmax > 0 else 1) * 0.015
+    umbral_texto = (cmax if cmax > 0 else 1) * 0.02
 
     for ax, s in zip(axes, ETAPAS):
         n_maq = MAQUINAS_POR_ETAPA[s]
-        for (j, b, m, ini, fin, _d) in gantt[s]:
+        for (j, b, m, ini, fin, _q) in gantt[s]:
             dur = fin - ini
             ax.barh(m, dur, left=ini, height=0.72, color=color_trabajo[j],
                     edgecolor='white', linewidth=0.6, alpha=0.92)
             if dur >= umbral_texto:
-                ax.text(ini + dur / 2, m, f"T{j}-S{b}", ha='center', va='center',
+                ax.text(ini + dur / 2, m, f"{j}-S{b}", ha='center', va='center',
                         fontsize=6.5, fontweight='bold', color='white', clip_on=True)
         ax.axvline(cmax, color='#333333', linewidth=1.2, linestyle='--', alpha=0.7)
         ax.set_yticks(range(n_maq))
-        ax.set_yticklabels([MAQUINAS[s][m]['id'] for m in range(n_maq)], fontsize=8)
-        ax.set_ylim(n_maq - 0.4, -0.6)   # M1 arriba
+        ax.set_yticklabels(MAQUINAS[s], fontsize=7)
+        ax.set_ylim(n_maq - 0.4, -0.6)   # primera máquina arriba
         ax.set_ylabel(f"Etapa {s}\n{NOMBRE_ETAPA[s]}", fontsize=9, fontweight='bold', labelpad=8)
         ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(4))
         ax.grid(axis='x', which='major', linestyle='--', linewidth=0.5, alpha=0.5, color='#bbbbbb')
@@ -1012,18 +1154,18 @@ def graficar_gantt(individuo: dict,
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
 
-    axes[-1].set_xlabel("Tiempo (horas)", fontsize=10)
+    axes[-1].set_xlabel("Tiempo (horas laborables)", fontsize=10)
     axes[-1].xaxis.set_major_locator(ticker.MaxNLocator(nbins=15))
     axes[-1].annotate(f"Cmax = {cmax:.2f} h", xy=(cmax, 1.0), xycoords=('data', 'axes fraction'),
                       xytext=(-4, -4), textcoords='offset points', fontsize=8, ha='right',
                       va='top', color='#333333')
 
-    fig.legend(handles=[mpatches.Patch(color=color_trabajo[j], label=f"Trabajo {j}")
+    fig.legend(handles=[mpatches.Patch(color=color_trabajo[j], label=f"{j} ({PRODUCTO[j]})")
                         for j in TRABAJOS],
                loc='lower center', ncol=min(len(TRABAJOS), 10), fontsize=9, frameon=True,
                framealpha=0.9, edgecolor='#cccccc', bbox_to_anchor=(0.5, -0.03))
-    fig.text(0.5, 1.002, f"Secuencia: {individuo['secuencia']}  |  ΣTi = {ind['suma_Ti']:.4f} h"
-                         f"  |  Cmax = {cmax:.4f} h  |  # tardíos = {ind['num_tardy']}",
+    fig.text(0.5, 1.002, f"ΣTi = {ind['suma_Ti']:.4f} h  |  Cmax = {cmax:.4f} h  |  "
+                         f"# tardíos = {ind['num_tardy']}",
              ha='center', va='bottom', fontsize=8.5, color='#444444', transform=fig.transFigure)
     plt.tight_layout(rect=[0, 0.04, 1, 0.99])
 
@@ -1035,7 +1177,7 @@ def graficar_gantt(individuo: dict,
     return fig
 
 # ---------------------------------------------------------------------------
-# 14. EXPORTAR RESULTADOS A EXCEL
+# 15. EXPORTAR RESULTADOS A EXCEL
 # ---------------------------------------------------------------------------
 
 def exportar_resultados(ruta: str, resumen: List[dict], reglas: List[dict],
@@ -1044,12 +1186,12 @@ def exportar_resultados(ruta: str, resumen: List[dict], reglas: List[dict],
     C, gantt = simular_hfs(mejor)
     ind = calcular_indicadores(C)
     df_reglas = pd.DataFrame([{
-        'Regla': r['regla'], 'Orden_etapa1': str(r['secuencia']),
+        'Regla': r['regla'], 'Orden_etapa1': " ".join(r['secuencia']),
         'ΣTi_h': round(r['suma_Ti'], 4), 'Tmax_h': round(r['Tmax'], 4),
         'Cmax_h': round(r['Cmax'], 4), 'Tardios': r['num_tardy']} for r in reglas])
     if exacto:
         df_reglas = pd.concat([df_reglas, pd.DataFrame([{
-            'Regla': 'ÓPTIMO permutación sin LS', 'Orden_etapa1': str(exacto['secuencia']),
+            'Regla': 'ÓPTIMO permutación sin LS', 'Orden_etapa1': " ".join(exacto['secuencia']),
             'ΣTi_h': round(exacto['suma_Ti'], 4), 'Tmax_h': round(exacto['Tmax'], 4),
             'Cmax_h': round(exacto['Cmax'], 4), 'Tardios': exacto['num_tardy']}])])
 
@@ -1070,7 +1212,7 @@ def exportar_resultados(ruta: str, resumen: List[dict], reglas: List[dict],
     print(f"  Resultados guardados en: {ruta}")
 
 # ---------------------------------------------------------------------------
-# 15. PROGRAMA PRINCIPAL
+# 16. PROGRAMA PRINCIPAL
 # ---------------------------------------------------------------------------
 
 def main(ruta_excel: str = RUTA_EXCEL, mostrar_gantt: bool = True):
@@ -1078,8 +1220,8 @@ def main(ruta_excel: str = RUTA_EXCEL, mostrar_gantt: bool = True):
 
     print()
     print(SEP)
-    print("  HFS CON LOT STREAMING POR ETAPA — GUANTES INDUSTRIALES")
-    print("  Sublotes independientes por etapa | AG | Mín. tardanza total")
+    print("  HFS CON LOT STREAMING — SUBLOTES CONSISTENTES — GUANTES INDUSTRIALES")
+    print("  Escenario S2 (Gürsoy Yılmaz & Yılmaz, 2022) | AG | Mín. tardanza total")
     print(SEP)
     print()
     imprimir_datos()
@@ -1095,16 +1237,16 @@ def main(ruta_excel: str = RUTA_EXCEL, mostrar_gantt: bool = True):
     lekin_tabla, lekin_res = validacion_lekin()
     imprimir_lekin(lekin_tabla, lekin_res)
 
-    # ── AG con lot streaming (población inicial sembrada con las reglas) ──
+    # ── AG con sublotes consistentes (población inicial sembrada con las reglas) ──
     semillas = [r['secuencia'] for r in reglas]
     if exacto:
         semillas.append(exacto['secuencia'])
     mejor, historial = algoritmo_genetico(semillas=semillas, verbose=True)
-    C_con, _ = simular_hfs(mejor)
+    C_con, gantt_con = simular_hfs(mejor)
     ind_con = calcular_indicadores(C_con)
 
-    imprimir_solucion("MEJOR SOLUCIÓN — AG CON LOT STREAMING POR ETAPA", mejor)
-    errores = verificar_programa(simular_hfs(mejor)[1])
+    imprimir_solucion("MEJOR SOLUCIÓN — AG CON SUBLOTES CONSISTENTES", mejor)
+    errores = verificar_programa(gantt_con)
     for r in reglas:
         errores += verificar_programa(simular_despacho(r['regla'])[1])
     if errores:
@@ -1113,13 +1255,13 @@ def main(ruta_excel: str = RUTA_EXCEL, mostrar_gantt: bool = True):
             print(f"    - {e}")
     else:
         print("  ✓ Verificación: los programas del AG y de las reglas son factibles "
-              "(sin traslapes, volúmenes completos y precedencias respetadas)\n")
-    imprimir_utilizacion(mejor)
+              "(sin traslapes, volúmenes completos, sublotes consistentes y "
+              "precedencias respetadas)\n")
     imprimir_comparacion(mejor_regla, ind_con, f"regla {mejor_regla['regla']}")
 
-    print("  Generando diagrama de Gantt...")
     if mostrar_gantt:
-        graficar_gantt(mejor, "Diagrama de Gantt — HFS con Lot Streaming por Etapa (AG)",
+        print("  Generando diagrama de Gantt...")
+        graficar_gantt(mejor, "Diagrama de Gantt — HFS con sublotes consistentes (AG)",
                        guardar_como=RUTA_GANTT)
 
     resumen = [
@@ -1131,10 +1273,10 @@ def main(ruta_excel: str = RUTA_EXCEL, mostrar_gantt: bool = True):
         resumen.append({'Metodo': 'Óptimo permutación sin LS (enumeración)',
                         'ΣTi_h': exacto['suma_Ti'], 'Cmax_h': exacto['Cmax'],
                         'Tmax_h': exacto['Tmax'], 'Tardios': exacto['num_tardy']})
-    resumen.append({'Metodo': 'AG con lot streaming', 'ΣTi_h': ind_con['suma_Ti'],
+    resumen.append({'Metodo': 'AG con sublotes consistentes', 'ΣTi_h': ind_con['suma_Ti'],
                     'Cmax_h': ind_con['Cmax'], 'Tmax_h': ind_con['Tmax'],
                     'Tardios': ind_con['num_tardy']})
-    resumen.append({'Metodo': f"Secuencia AG: {mejor['secuencia']}"})
+    resumen.append({'Metodo': "Posiciones de sublotes AG: " + " ".join(mejor['secuencia'])})
     exportar_resultados(RUTA_RESULTADOS, resumen, reglas, exacto, mejor, historial,
                         lekin_tabla, lekin_res)
 
